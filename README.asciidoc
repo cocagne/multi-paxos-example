@@ -1,0 +1,395 @@
+:toc:
+
+Multi-Paxos Example
+===================
+Tom Cocagne <tom.cocagne@gmail.com>
+
+
+Purpose
+-------
+
+Paxos and multi-paxos have been around for decades but there are few reference
+implementations for those learning the subjects to experiment with. This
+repository contains a demonstration application specifically intended to fill
+that role. The application maintains a single replicated value across a cluster
+of nodes and the code is implemented with an eye towards strong separations of
+concerns so that implementations for various aspects of the codebase may be
+easily swapped out.
+
+This example uses very simple but functional strategies for each of the
+implementation-defined aspects of multi-paxos. The strategies are far too
+simplistic for effective real-world use but they do work and the result is a
+small and relatively simple code base. This will hopefully show that multi-paxos
+isn't 'inherently' all that complex or difficult to implement. When enhanced
+for operation in practical environments, a significant level of complexity may
+need to be added but as this example also demonstrates, software designs
+emphasizing a strong separation-of-concerns can effectively compartmentalize the
+areas of complexity and isolate them from one another.
+
+
+Implementation Approach
+-----------------------
+
+The code is written in Python using an asynchronous programming model. The
+http://www.twistedmatrix.org/[Twisted] framework is used to provide UDP
+networking, the asynchronous callback mechanism, function scheduling, and the
+overall reactor loop. To make the code easier to read by those not overly
+familiar with Python and/or Twisted, the use of most advanced features in both
+has been eschewed in favor of more straight-forward implementations. For the few
+that are used, a <<python_ref,section>> towards the end of this readme is
+dedicated to providing a brief overview of how they work.
+
+Separation-of-concerns is one of the main goals of the code and
+<<mixin_classes,Mixin Classes>> are the primary means by which this is
+accomplished. Mixin classes are well suited for cleanly encapsulating the
+resolution, synchronization, and master-lease implementations. In addition to
+enhancing clarity, mixin classes provide a convenient means for swapping in
+alternative implementations and allowing conditional inclusion of optional
+functionality. The master lease implementation, for example, is purely an
+optimization and is not required for correct operation. The server
+implementation allows this feature to be used or excluded via a command-line
+flag. 
+
+The configuration of the multi-paxos chain is defined in 'config.py' and
+defaults to 3 servers with UIDs of 'A', 'B', and 'C'. A minimum of two must be
+used for consensus to be reached. Each server uses a state file to support
+recovery and it defaults to +/tmp/<UID>.json+ (Windows users will need to adjust
+the file name). If a server is offline while the chain is modified, the catchup
+process will bring it up to date within a relatively short period of time.
+
+.Running the server
+[source,bash]
+--------------------------------------------------------------------------------
+# Without Master Leases:
+$ python server.py <A|B|C>
+$
+# With Master Leases
+$ python server.py --master <A|B|C>
+--------------------------------------------------------------------------------
+
+The client application requires a server id and a new value to propose.
+The provided server will be requested to set the value to the second argument
+via a fire-and-forget UDP packet. No error checking is done so if the server
+is offline or there is a networking error, it will not be reported. Also,
+when master leases are being used, the client will not warn in the event that the
+request is sent to a non-master peer. Instead, the receiving server will print an
+error message that states which peer is currently the master. It is assumed
+that all of the servers and the client will be run on the same screen but in
+different terminals.
+
+.Running the client
+[source,bash]
+--------------------------------------------------------------------------------
+$ python client.py <A|B|C> <new_value>
+--------------------------------------------------------------------------------
+
+
+Understanding the Source
+------------------------
+
+To quickly get up to speed on the implementation, the recommended order
+to follow is:
+
+. If unfamiliar with <<mixin_classes,Mixin Classes>> or <<python_ref, Python & Twisted>>
+  read through those sections first.
+. Read through the overviews provided here on each module to get a sense for
+  how the pieces are intended to fit together.
+. Look through 'composable_paxos.py' to see how the core Paxos algorithm is
+  implemented.
+. Look through 'replicated_value.py' to see how instances are chained together
+  to maintain a single, replicated value.
+. Look through 'resolution_strategy.py' to see how the mixin class adds
+  retransmissions and exponential backoffs to the passive baseclass.
+. Look through 'sync_strategy.py' to see how falling behind is detected
+  and how catching up is achieved.
+. Look through 'server.py' to see how the mixin classes are woven together
+. Finally, look through 'master_strategy.py' to see how master leases and
+  single-round-trip resolution can be added to the basic implementation.
+
+
+messenger.py
+~~~~~~~~~~~~
+
+The Messenger class encapsulates the message-passing strategy for the
+application. +BaseReplicatedValue+ instances send messages by calling one of the
+Messenger's +send_<message-type>+ methods and receive messages by specifying a
++receive_<message-type>+ method for each message type it supports. The messenger
+class will dynamically look up the method for handling incoming packets by
+searching the class hierarchy for an appropriately named method based off of the
+incoming message's message type.
+
+To keep things simple for this example, messages are sent over UDP and use a
+simple JSON encoding format.
+
+
+
+composable_paxos.py
+~~~~~~~~~~~~~~~~~~~
+
+This module, which is also available as stand alone and pip-installable package,
+defines the core Paxos algorithm as a set of composable classes. The classes are
+completely agnostic of the messaging approach used by the enclosing
+application. Message reception is modeled as method calls where the arguments
+are the message content and message transmission is modeled by returned objects
+that contain the message content.
+
+
+
+replicated_value.py
+~~~~~~~~~~~~~~~~~~~
+
+This module defines the +BaseReplicatedValue+ class and preforms three
+functions:
+
+* Maintains the multi-paxos chain by tracking the current instance and creating
+  a new +PaxosInstance+ object each time resolution is achieved.
+* Serves as a bridge between the +Messenger+ class that provides access to the 
+  network and the current +PaxosInstance+ object
+* Saves and restores state from a file prior to sending each Promise and 
+  Accept message as well as each time resolution is achieved.
+
+Of particular note is that this class is completely passive. When a message is
+received from a client, this class simply converts the message into a call to
+the underlying +composable_paxos.PaxosInstance+ instance and potentially sends a
+reply message. It does not, however, initiate the sending of any original
+messages or try to drive the resolution process forward. Those details as well
+as those of catch up and master-lease strategies are left to mixin classes.
+
+
+
+resolution_strategy.py
+~~~~~~~~~~~~~~~~~~~~~~
+
+This module defines a mixin class that implements all of the logic needed to
+ensure that a Paxos instance will eventually achieve resolution. It does
+so by immediately attempting to drive the process forward if it is the first
+to propose a value and it steps in to continue driving the process forward if
+another peer falls silent before completing the process. Continual inter-peer
+interference is avoided by using randomized sleeps within a backoff window
+that doubles in size each time a collision occurs.
+
+The effective entry points to this Mixin class are the overridden
++propose_update+ and +receive_accept+ methods. Both of these methods make the
+strategy aware that a value has been proposed so the resolution process must be
+driven to completion. In the +propose_update+ case, the peer may immediately
+begin attempting to drive the process forward. In the +receive_accept+ case, the
+peer delays attempting to drive the process forward until the messaging has
+ceased for a while; otherwise all peers would immediately conflict with the
+original driver.
+
+
+
+sync_strategy.py
+~~~~~~~~~~~~~~~~
+
+This module defines a mixin class that periodically sends a message to a random
+peer that specifies what link number it is currently on. If the receiving peer
+sees that the sender has fallen behind, it will respond with a message stating
+the current link number and the current value. The behind peer will then advance
+it's current instance to match that contained in the reply and will update its
+current value accordingly. 
+
+
+
+master_strategy.py
+~~~~~~~~~~~~~~~~~~
+
+This module defines a Mixin class that implements 'Master-Leases' and resolution
+in a single round trip. While the lease is held, only that peer is allowed to
+add links to the chain and the link additions will generally require only a
+single round-trip to achieve consensus.
+
+The muli-paxos chain itself is used to manage the identity of the master. The
+values in the chain are two-element tuples in which one element is always
++None+. If the left element is set, it indicates a new master has been
+elected. If the right element is set, it indicates a new application-level
+value.
+
+To avoid problems associated with clock-synchronization, each peer starts their
+timer for the lease hold duration when they learn about the new master. All
+peers will have slightly differing ideas about when the lease expires and this
+may delay the elections of new masters but the current master will always attempt
+to renew its lease prior to the expiry of the current one. As a result,
+leadership changes will be infrequent occurrences.
+
+This strategy is somewhat dependent upon the resolution strategy implementation
+due to the need to augment the handling of the initial proposal for
+single-round-trip messaging semantics. While the dedicated master lease is held,
+the initial 'Prepare' message and the corresponding 'Promise' message are
+locally generated and injected into the +PaxosInstance+ object. This avoids the
+need to actually send them over the network. The master strategy makes a small
+change to the resolution strategy's handling of the initial proposal by causing
+it to simply drop the initial 'Prepare' message. All subsequent messages are
+handled in the normal manner.
+
+The overriding goals of this implementation are:
+
+* Ensure that a new master is elected if the current lease expires
+* Ensure that only the master can add links containing application-level values
+* Ensure that no two peers may simultaneously believe themselves to be the master
+
+
+
+config.py
+~~~~~~~~~
+
+Defines the members of the multi-paxos group, nodes 'A', 'B', and 'C'; and
+specifies which UDP port they will run on. Additionally, each node is configured
+to use a separate file for storing state. This file is used to during recovery
+and ensures that it is safe to kill the server processes at any time.
+
+
+client.py
+~~~~~~~~~
+
+This module implements about the simplest possible client application for
+submitting requests for new values. The first argument to the program is the UID
+of the peer to send the request to and the second argument is the new value to
+use. The client does not wait for a response or check for errors; it simply
+creates the UDP request packet, sends it to the specified peer, and exits.
+
+
+server.py
+~~~~~~~~~
+
+As the name suggests, this module implements the server component. The server
+takes a single argument which identifies the UID the server should use while
+running. The server may be stopped at any point via Ctrl+C and it will pick up
+where it left off the next time it's run. The server takes an optional
++--master+ argument that enables the use of the master-leases mixin class. All
+peers should either use or not use the +--master+ flag simultaneously but there
+is no other restriction on the use of this flag. Use of the master flag can be
+turned on and off for the same chain so long as all peers are taken down prior
+to making the switch.
+
+All sent and received message traffic as well as the result of each resolution
+is printed to the console. 
+
+
+Uncommon Design & Feature Reference
+-----------------------------------
+
+[[mixin_classes]]
+Mixin Classes
+~~~~~~~~~~~~~
+
+For individuals coming from more traditional languages like C++/Java this may be
+something of a foreign concept. Mixin classes are not all that common even in
+the Python community but Scala developers familiar with trait stacking should
+feel right at home. The basic concept behind Mixins is to create classes that
+augment the behavior of a base class by overriding specific methods and having
+those overriding methods explicitly call up the inheritance chain. Classes that
+follow this pattern may then be "Mixed" together in various ways to combine
+those augmentations. This is subtly different from traditional multiple
+inheritance so working through an example may aid in understanding how it works:
+
+[source,python]
+--------------------------------------------------------------------------------
+
+class NumberQueue(object):
+    def __init__(self):
+        self.q = list()
+
+    def put(self, value):
+        self.q.append( value )
+
+    def printSelf(self):
+        print repr(self.q)
+
+class DoublingMixin(object):
+
+    def put(self, value):
+        super(DoublingMixin,self).put( value * 2 )
+
+class IncrementingMixin(object):
+
+    def put(self, value):
+        super(IncrementingMixin,self).put( value + 1 )
+
+# In Python, calls to 'super' go left-to-right through peer super classes
+
+class Doubler (DoublingMixin, NumberQueue):
+    pass
+
+class DoublerIncrementer (DoublingMixin, IncrementingMixin, NumberQueue):
+    pass
+
+class IncrementerDoubler (IncrementingMixin, DoublingMixin, NumberQueue):
+    pass
+
+def show(kind, q):
+    q.put(2)
+    q.put(3)
+    q.put(4)
+    print kind,
+    q.printSelf()
+
+show('Original:          ', NumberQueue())
+show('Doubler:           ', Doubler())
+show('DoublerIncrementer:', DoublerIncrementer())
+show('IncrementerDoubler:', IncrementerDoubler())
+
+# Outputs:
+#    Original:           [2, 3, 4]
+#    Doubler:            [4, 6, 8]
+#    DoublerIncrementer: [5, 7, 9]
+#    IncrementerDoubler: [6, 8, 10]
+--------------------------------------------------------------------------------
+
+
+[[python_ref]]
+Python & Twisted Features
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Python is often referred to as "executable pseudo code" due to its rather
+straight-forward nature and the ease with which even those not familiar with the
+language can read the source code. This example intentionally shies away from the
+more advanced Python & Twisted features in order to enhance readability but it
+does use a few features that are not particularly intuitive. The following list
+provides some additional context on them.
+
+Python's super() command::
+  Python's +super()+ command is typically invoked as
+  +super(+'<class_name>'+,self).+'<method_name>' and it searches up the
+  inheritance hierarchy for the requested method. The wrinkle, as compared to
+  C++ and Java, is that it searches left-to-right through peer inherited classes
+  rather than going straight up at each tier in the hierarchy. The 'Mixin'
+  example demonstrates how software designs may take advantage of this.
+
+Twisted's task.LoopingCall::
+  The +task.LoopingCall()+ constructor accepts a function object as an argument
+  and returns an object that is capable of repeatedly calling the function
+  object at set intervals. The interval is begun with the 'start(<duration>,
+  [now=True|False])' method. When the optional, 'now' argument is supplied, the
+  function will be immediately invoked without first waiting for 'duration' to
+  elapse. This implementation makes use of both the delayed initial
+  invocation as well as the immediate invocation.
+  +
+  Of particular note is that all scheduling calls in Twisted, such as
+  +start(<duration>)+, use floating-point times with seconds as the
+  dimension. Fractional values are permitted so to call a function at 60Hz one
+  could use +start(1.0/60.0)+.
+
+Python's lambda command::
+  Python's +lambda+ command creates an unnamed function that returns whatever
+  the right-hand side evaluates to. In this example, lambda is used
+  to create callback functions that, when called, will invoke another function
+  with a certain set of arguments. For example, the following call will print
+  "Hello World" every 5 seconds:
+  +
+[source,python]
+--------------------------------------------------------------------------------
+from __future__ import print_function
+from twisted.internet import task
+
+task.LoopingCall( lambda : print("Hello World") ).start(5.0)
+--------------------------------------------------------------------------------
+
+Twisted's reactor.callLater::
+  This schedules a function object to be called at some point in the future.
+  the method signature is
+  +reactor.callLater(+'<duration_in_seconds>'+,+'<function>'+)+
+  and it returns an object that may be used to cancel the delayed invocation.
+  As with LoopingCall, the duration is a floating-point value and may be used
+  to specify delays of less than a second.
+
