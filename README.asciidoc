@@ -26,6 +26,8 @@ need to be added but as this example also demonstrates, software designs
 emphasizing a strong separation-of-concerns can effectively compartmentalize the
 areas of complexity and isolate them from one another.
 
+This repository was created as a companion to the
+https://understandingpaxos.wordpress.com[Understanding Paxos] paper.
 
 Implementation Approach
 -----------------------
