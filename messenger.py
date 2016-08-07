@@ -16,7 +16,7 @@ class Messenger(protocol.DatagramProtocol):
         self.replicated_val = replicated_val
 
         # provide two-way mapping between endpoints and server names
-        for k,v in self.addrs.items():
+        for k,v in list(self.addrs.items()):
             self.addrs[v] = k
 
         reactor.listenUDP( peer_addresses[uid][1], self )
