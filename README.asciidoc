@@ -33,7 +33,7 @@ Implementation Approach
 -----------------------
 
 The code is written in Python using an asynchronous programming model. The
-http://www.twistedmatrix.org/[Twisted] framework is used to provide UDP
+http://www.twistedmatrix.com/[Twisted] framework is used to provide UDP
 networking, the asynchronous callback mechanism, function scheduling, and the
 overall reactor loop. To make the code easier to read by those not overly
 familiar with Python and/or Twisted, the use of most advanced features in both
